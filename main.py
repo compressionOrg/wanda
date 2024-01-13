@@ -8,6 +8,12 @@ from importlib.metadata import version
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 from lib.eval import eval_ppl, eval_zero_shot
 
+# 配置 hf镜像
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import huggingface_hub
+huggingface_hub.login("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", add_to_git_credential=True)
+
 print('torch', version('torch'))
 print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
