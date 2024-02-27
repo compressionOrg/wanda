@@ -3,3 +3,5 @@
 *.pyc
 *.DS_Store
 llm_weights
+prune_models/*
+out/*

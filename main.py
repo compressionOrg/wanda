@@ -9,10 +9,10 @@ from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablat
 from lib.eval import eval_ppl, eval_zero_shot
 
 # 配置 hf镜像
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+# os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-import huggingface_hub
-huggingface_hub.login("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", add_to_git_credential=True)
+# import huggingface_hub
+# huggingface_hub.login("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", add_to_git_credential=True)
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -64,7 +64,7 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:2")
     if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
         device = model.hf_device_map["lm_head"]
     print("use device ", device)

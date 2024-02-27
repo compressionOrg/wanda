@@ -115,14 +115,36 @@ def prepare_calibration_input(model, dataloader, device):
 
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
-    thres_cumsum = sum_before * alpha 
-    sort_mask = tmp_metric <= thres_cumsum.reshape((-1,1))
-    thres = torch.gather(sort_res[0], dim=1, index=sort_mask.sum(dim=1, keepdims=True)-1)
-    W_mask = (W_metric <= thres)
-    cur_sparsity = (W_mask==True).sum() / W_mask.numel()
-    return W_mask, cur_sparsity
+    # alpha: 一个阈值系数
+    # sort_res: 排序后的结果，可能是权重或其他度量的排序数组
+    # W_metric: 权重或其他度量的原始矩阵
+    # tmp_metric: 用于确定阈值的度量，可能是累积和或其他统计量
+    # sum_before: tmp_metric 中元素的累积和
 
-def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    thres_cumsum = sum_before * alpha 
+    # 计算累积和与 alpha 的乘积，得到一个累积的阈值
+
+    sort_mask = tmp_metric <= thres_cumsum.reshape((-1,1))
+    # 使用广播机制，将 thres_cumsum 调整为与 tmp_metric 相同的形状，并创建一个掩码，
+    # 掩码的每个元素表明 tmp_metric 中的对应元素是否小于等于 thres_cumsum
+
+    thres = torch.gather(sort_res[0], dim=1, index=sort_mask.sum(dim=1, keepdims=True)-1)
+    # sort_res[0] 表示取 sort_res 的第一行
+    # sort_mask.sum(dim=1, keepdims=True) 在第二维上求和，并保持维度不变，结果是每行的掩码和
+    # 减去1来得到索引（因为Python是基于0的索引）
+    # torch.gather 根据这些索引从 sort_res[0] 中收集元素，构成一个新的阈值张量 thres
+
+    W_mask = (W_metric <= thres)
+    # 创建一个新的掩码 W_mask，标记 W_metric 中所有小于等于阈值 thres 的元素
+
+    cur_sparsity = (W_mask==True).sum() / W_mask.numel()
+    # 计算稀疏性，即 W_mask 中为 True 的元素数除以 W_mask 中元素总数
+
+    return W_mask, cur_sparsity
+    # 返回计算得到的掩码 W_mask 和稀疏性 cur_sparsity
+
+
+def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:2"), prune_n=0, prune_m=0):
     layers = model.model.layers 
 
     for i in range(len(layers)):
@@ -144,7 +166,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:2"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 

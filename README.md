@@ -39,12 +39,14 @@ The [scripts](scripts) directory contains all the bash commands to replicate the
 
 Below is an example command for pruning LLaMA-7B with Wanda, to achieve unstructured 50% sparsity.
 ```sh
+export HF_ENDPOINT=https://hf-mirror.com
 python main.py \
     --model jeffwan/llama-7b-hf \
     --prune_method wanda \
     --sparsity_ratio 0.5 \
     --sparsity_type unstructured \
-    --save out/llama_7b/unstructured/wanda/ 
+    --save out/llama_7b/unstructured/wanda/ \
+    --save_model prune_models/llama_7b_pruned/
 ```
 We provide a quick overview of the arguments:  
 - `--model`: The identifier for the LLaMA model on the Hugging Face model hub.
@@ -74,6 +76,7 @@ python main.py \
     --sparsity_ratio 0.5 \
     --sparsity_type unstructured \
     --save out/llama2_7b/unstructured/wanda/
+    --save_model prune_models/llama2_7b_wanda_unstructured_0.5
 ```
 LLaMA-2 results: (LLaMA-2-34b is not released as of 9.22.2023)
 |sparsity| ppl              | llama2-7b | llama2-13b | llama2-70b |
