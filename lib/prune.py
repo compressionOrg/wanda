@@ -145,110 +145,147 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
 
 
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:2"), prune_n=0, prune_m=0):
+    # 获取模型的层列表
     layers = model.model.layers 
 
+    # 遍历每个层
     for i in range(len(layers)):
         layer = layers[i]
+        # 找到需要剪枝的子集层
         subset = find_layers(layer)
 
+        # 遍历子集层中的每个层
         for name in subset:
+            # 获取层的权重
             W = subset[name].weight.data 
+            # 计算权重的绝对值，作为剪枝的度量
             W_metric = torch.abs(W)
+            
+            # 判断是否进行结构化剪枝
             if prune_n != 0:
-                W_mask = (torch.zeros_like(W)==1)
+                # 初始化一个与权重形状相同的全零张量，用于创建剪枝掩码
+                W_mask = (torch.zeros_like(W) == 1)
+                
+                # 遍历权重的列
                 for ii in range(W_metric.shape[1]):
+                    # 判断是否为结构化剪枝的列
                     if ii % prune_m == 0:
+                        # 获取当前结构化剪枝列的剪枝度量
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+                        # 根据剪枝度量，创建剪枝掩码，将对应的权重位置设为零
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
-                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
-                W_mask = (W_metric<=thresh)
+                # 计算剪枝阈值，通过将剪枝比例乘以权重总数得到剪枝阈值的位置，并取出该位置的权重值
+                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel() * args.sparsity_ratio)].cpu()
+                # 根据阈值创建剪枝掩码，将小于等于阈值的位置设为True
+                W_mask = (W_metric <= thresh)
 
+            # 根据剪枝掩码，将对应的权重位置设为零，完成剪枝操作
             W[W_mask] = 0
 
+
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:2"), prune_n=0, prune_m=0):
+    # 保存原始模型缓存配置，并暂时禁用它。
+    # 确保修剪校准期间不使用之前的计算结果。
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    # 开始加载校准数据，并在加载完成后通知。
+    print("loading calibration data")
+    dataloader, _ = get_loaders(
+        "c4", 
+        nsamples=args.nsamples, 
+        seed=args.seed, 
+        seqlen=model.seqlen, 
+        tokenizer=tokenizer
+    )
     print("dataset loading complete")
+
+    # 准备校准输入，同时不追踪梯度以提高效率。
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
 
+    # 获取模型内部的层列表。
     layers = model.model.layers
+
+    # 遍历每一层进行修剪操作。
     for i in range(len(layers)):
         layer = layers[i]
-        subset = find_layers(layer)
+        subset = find_layers(layer)  # 查找需要修剪的层的子集。
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        # 如果模型有设备映射（可能是多GPU情况），则进行相应的设备分配。
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            inps, outs, attention_mask, position_ids = (
+                inps.to(dev), 
+                outs.to(dev), 
+                attention_mask.to(dev), 
+                position_ids.to(dev)
+            )
 
+        # 初始化一个字典用于存储层的包装器。
         wrapped_layers = {}
         for name in subset:
             wrapped_layers[name] = WrappedGPT(subset[name])
 
+        # 定义添加批处理数据的函数，用于钩子中。
         def add_batch(name):
+            # 定义临时函数，获取输入输出并添加到对应的包装层。
             def tmp(_, inp, out):
                 wrapped_layers[name].add_batch(inp[0].data, out.data)
             return tmp
 
+        # 注册前向钩子，并将句柄添加到列表以便之后移除。
         handles = []
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        # 对每个校准样本执行前向传播，并收集数据。
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        # 移除之前注册的所有钩子。
         for h in handles:
             h.remove()
 
+        # 对每个子集中的层进行修剪操作。
         for name in subset:
             print(f"pruning layer {i} name {name}")
+            # 计算修剪度量，基于权重的绝对值和对应的激活函数
             W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            # 初始化修剪掩码，开始时全为False。
+            W_mask = (torch.zeros_like(W_metric) == 1)
+
+            # 如果设置了结构化修剪参数，则执行结构化修剪。
             if prune_n != 0:
-                # structured n:m sparsity
+                # 结构化n:m稀疏性
                 for ii in range(W_metric.shape[1]):
                     if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+                        tmp = W_metric[:, ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
+                # 非结构化修剪
                 sort_res = torch.sort(W_metric, dim=-1, stable=True)
+                indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+                W_mask.scatter_(1, indices, True)
 
-                if args.use_variant:
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
+            # 最后将掩码为True的权重值设为零，完成修剪。
+            subset[name].weight.data[W_mask] = 0
 
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
-                else:
-                    # unstructured pruning
-                    indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                    W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
+        # 再次对每个样本执行前向传播，可能用于验证修剪效果。
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        # 交换输入和输出的引用，为下一轮或后续操作准备。
         inps, outs = outs, inps
 
+    # 恢复模型的缓存设置。
     model.config.use_cache = use_cache 
+
+    # 清空CUDA缓存，以减少内存消耗。
     torch.cuda.empty_cache()
 
 
@@ -256,12 +293,16 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:2"), prune_n=0
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    
+    # 获取数据加载器和其他相关信息
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
 
+    # 设置模型缓存的使用信息
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
 
+    # 设置模型的计算设备
     if "model.embed_tokens" in model.hf_device_map:
         dev = model.hf_device_map["model.embed_tokens"]
 
@@ -271,6 +312,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     )
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
+    # 创建Catcher类，用于捕获输入数据并存储到inps中
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -281,78 +323,101 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
+    
+    # 将第一个层替换为Catcher类，以便捕获输入数据
     layers[0] = Catcher(layers[0])
+    
+    # 遍历数据加载器，获取输入数据并存储到inps中
     for batch in dataloader:
         try:
             model(batch[0].to(dev))
         except ValueError:
             pass
+    
+    # 将第一个层恢复为原来的层
     layers[0] = layers[0].module
     torch.cuda.empty_cache()
 
+    # 创建与inps形状相同的张量，用于存储模型的输出
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
 
     print('Ready.')
 
+    # 遍历每个层
     for i in range(len(layers)):
         layer = layers[i]
+        # 获取当前层的计算设备信息
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             print(f"layer {i} device {dev}")
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
+        # 找到需要剪枝的子集层
         subset = find_layers(layer)
 
+        # 创建存储SparseGPT对象的字典
         gpts = {}
         for name in subset:
             gpts[name] = SparseGPT(subset[name])
 
+        # 创建处理每个子集层的回调函数
         def add_batch(name):
             def tmp(_, inp, out):
                 gpts[name].add_batch(inp[0].data, out.data)
             return tmp
 
         handles = []
+        # 注册回调函数，用于捕获每个子集层的输入和输出数据
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
+        # 处理每个输入样本，获取模型的输出并存储到outs中
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
         for h in handles:
             h.remove()
 
+        # 针对每个子集层进行剪枝操作
         for name in gpts:
             print(i, name)
             print('Pruning ...')
 
+            # 使用SparseGPT对象进行剪枝，指定剪枝比例和剪枝数量
             gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
             gpts[name].free()
 
+        # 处理每个输入样本，获取模型的输出并存储到outs中
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
 
+        # 更新当前层的权重
         layers[i] = layer 
         torch.cuda.empty_cache()
 
+        # 交换inps和outs的值，用于下一层的计算
         inps, outs = outs, inps
 
+    # 恢复模型的缓存使用设置
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
-
 
 
 @torch.no_grad()
 def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
 
+    # 获取数据加载器和其他相关信息
+    dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+
+    # 设置模型缓存的使用信息
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
 
+    # 设置模型的计算设备
     if "model.embed_tokens" in model.hf_device_map:
         dev = model.hf_device_map["model.embed_tokens"]
 
@@ -362,6 +427,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     )
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
+    # 创建Catcher类，用于捕获输入数据并存储到inps中
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -372,43 +438,57 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
+
+    # 将第一个层替换为Catcher类，以便捕获输入数据
     layers[0] = Catcher(layers[0])
+
+    # 遍历数据加载器，获取输入数据并存储到inps中
     for batch in dataloader:
         try:
             model(batch[0].to(dev))
         except ValueError:
             pass
+
+    # 将第一个层恢复为原来的层
     layers[0] = layers[0].module
     torch.cuda.empty_cache()
 
+    # 创建与inps形状相同的张量，用于存储模型的输出
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
 
     print('Ready.')
 
+    # 遍历每个层
     for i in range(len(layers)):
         layer = layers[i]
+        # 获取当前层的计算设备信息
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             print(f"layer {i} device {dev}")
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
+        # 找到需要剪枝的子集层
         subset = find_layers(layer)
 
+        # 创建存储AblateGPT对象的字典
         gpts = {}
         for name in subset:
             gpts[name] = AblateGPT(subset[name])
 
+        # 创建处理每个子集层的回调函数
         def add_batch(name):
             def tmp(_, inp, out):
                 gpts[name].add_batch(inp[0].data, out.data)
             return tmp
 
         handles = []
+        # 注册回调函数，用于捕获每个子集层的输入和输出数据
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
+        # 处理每个输入样本，获取模型的输出并存储到outs中
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
         for h in handles:
@@ -418,6 +498,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             print(i, name)
             print('Pruning ...')
 
+            # 根据剪枝方法选择剪枝掩码
             if args.prune_method == "ablate_wanda_seq":
                 prune_mask = gpts[name].get_wanda_mask(args.sparsity_ratio, prune_n, prune_m)
             elif args.prune_method == "ablate_mag_seq":
@@ -425,16 +506,21 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             elif "iter" in args.prune_method:
                 prune_mask = None 
 
+            # 使用AblateGPT对象进行剪枝，指定剪枝比例、剪枝掩码和剪枝数量
             gpts[name].fasterprune(args, args.sparsity_ratio, mask=prune_mask, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
             gpts[name].free()
 
+        # 处理每个输入样本，获取模型的输出并存储到outs中
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
 
+        # 更新当前层的权重
         layers[i] = layer 
         torch.cuda.empty_cache()
 
+        # 交换inps和outs的值，用于下一层的计算
         inps, outs = outs, inps
 
+    # 恢复模型的缓存使用设置
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
